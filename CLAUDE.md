@@ -37,9 +37,19 @@ At most 4,096 processes and threads, and at most 50 MB on stdout (log to stderr)
   reader's null string) go through a byte-exact `read_text` + regex path instead.
 - Fast path: `read_csv` with `quote=''`, one extra sentinel column, `null_padding`, `strict_mode`,
   `ignore_errors`, `nullstr='\x02'`, so field counts are exact; quotes are checked per field.
-- Speed lessons (60M events, 8 threads, M-series Mac: 45s first version -> ~23-26s):
+- Current local times (8 threads, M-series Mac): public 1M dev set ~0.5s (MATCH); real 60M ~27s.
+  The submission's first gate is the 1M dev set, so small-input overheads matter.
+- Speed lessons:
   - Dedup: `QUALIFY row_number()` beats `arg_min(struct)` group-by by 2-3x.
   - Windows with frames (`ROWS UNBOUNDED PRECEDING`) over 54M rows are ~3x slower than
     frame-free `lag`/`lead`/`row_number`; sessionize with those only.
-  - Tried and rejected: replace-based quote stripping, whole-line regex on concat_ws.
+  - Macros inline their arguments at every mention: a macro over a computed expression
+    recomputes it each time. Keep macro bodies short and arguments plain columns (or
+    materialize first). This made timestamp parsing several times slower.
+  - `try_strptime` is ~7x slower than `strptime`; `TRY_CAST(... AS TIMESTAMP)` is fast.
+  - Independent steps run concurrently on separate cursors (`run_parallel`); DuckDB shares
+    one thread pool, so small inputs stop leaving threads idle.
+  - CREATE TABLE of a big intermediate costs ~4x a materialized CTE; avoid large tables.
+  - Tried and rejected: replace-based quote stripping, whole-line regex on concat_ws,
+    translate()-based timestamp shape checks (slower than RE2), lambda-wrapped parsing.
 - `PROFILE_DIR=dir` writes DuckDB operator timings per statement (times are CPU, summed over threads).

@@ -324,106 +324,118 @@ run_parallel(build_links, build_events, build_clicks)
 EV = "(SELECT coalesce(m.person, k.user_id) AS person, k.ts, k.is_p, k.price, k.product_id " \
      "FROM ev_kept k LEFT JOIN idmap m ON m.id = k.user_id)"
 
-# Sessionize per person in one sort, with frame-free window functions only. Each
-# event gets its previous/next ts and row number; only session starts (first event,
-# or gap > 30 min) and each person's last event are kept, and a session's event
-# count is the row-number difference to the boundary after it. Equal timestamps
-# have gap 0 and so share a session.
-con.execute(f"""
-CREATE TABLE sess AS
-WITH w AS (
-    SELECT person, ts, lag(ts) OVER o AS prev, lead(ts) OVER o AS nxt, row_number() OVER o AS rn
-    FROM {EV} WINDOW o AS (PARTITION BY person ORDER BY ts)
-), edges AS (
-    -- kind 0: a session start, with the count of events before it
-    -- kind 1: the person's last event, with the count through it
-    SELECT person, ts, kind, CASE WHEN kind = 0 THEN rn - 1 ELSE rn END AS c_n
-    FROM (SELECT *, unnest(CASE WHEN is_start AND nxt IS NULL THEN [0, 1]
-                                WHEN is_start THEN [0] ELSE [1] END) AS kind
-          FROM (SELECT *, (prev IS NULL OR ts - prev > {GAP}) AS is_start FROM w)
-          WHERE is_start OR nxt IS NULL)
-), spans AS (
-    SELECT person, ts AS start, kind, lead(c_n) OVER o - c_n AS n_events,
-           sum(1 - kind) OVER (o ROWS UNBOUNDED PRECEDING) AS sno
-    FROM edges WINDOW o AS (PARTITION BY person ORDER BY c_n)
-)
-SELECT person, sno::BIGINT AS sno, start, (DATE '1970-01-01' + (start // {DAY})::INT) AS day, n_events
-FROM spans WHERE kind = 0
-""")
-# Purchases (a few % of events), each tied to its session: the latest start at or before it.
-con.execute(f"""
-CREATE TABLE purch AS
-SELECT e.person, s.sno, s.day, e.price, e.product_id
-FROM (SELECT coalesce(m.person, k.user_id) AS person, k.ts, k.price, k.product_id
-      FROM ev_kept k LEFT JOIN idmap m ON m.id = k.user_id WHERE k.is_p) e
-ASOF JOIN sess s ON e.person = s.person AND e.ts >= s.start
-""")
-con.execute("DROP TABLE ev_kept")
-con.execute("CREATE TABLE sess_rev AS SELECT person, sno, sum(price) AS revenue FROM purch GROUP BY person, sno")
-log(f"sessions: {con.execute('SELECT count(*) FROM sess').fetchone()[0]}")
+def build_sessions(con):
+    """sess(person, sno, start, day, n_events), purch, sess_rev."""
+    # Sessionize per person in one sort, with frame-free window functions only. Each
+    # event gets its previous/next ts and row number; only session starts (first event,
+    # or gap > 30 min) and each person's last event are kept, and a session's event
+    # count is the row-number difference to the boundary after it. Equal timestamps
+    # have gap 0 and so share a session.
+    con.execute(f"""
+    CREATE TABLE sess AS
+    WITH w AS (
+        SELECT person, ts, lag(ts) OVER o AS prev, lead(ts) OVER o AS nxt, row_number() OVER o AS rn
+        FROM {EV} WINDOW o AS (PARTITION BY person ORDER BY ts)
+    ), edges AS (
+        -- kind 0: a session start, with the count of events before it
+        -- kind 1: the person's last event, with the count through it
+        SELECT person, ts, kind, CASE WHEN kind = 0 THEN rn - 1 ELSE rn END AS c_n
+        FROM (SELECT *, unnest(CASE WHEN is_start AND nxt IS NULL THEN [0, 1]
+                                    WHEN is_start THEN [0] ELSE [1] END) AS kind
+              FROM (SELECT *, (prev IS NULL OR ts - prev > {GAP}) AS is_start FROM w)
+              WHERE is_start OR nxt IS NULL)
+    ), spans AS (
+        SELECT person, ts AS start, kind, lead(c_n) OVER o - c_n AS n_events,
+               sum(1 - kind) OVER (o ROWS UNBOUNDED PRECEDING) AS sno
+        FROM edges WINDOW o AS (PARTITION BY person ORDER BY c_n)
+    )
+    SELECT person, sno::BIGINT AS sno, start, (DATE '1970-01-01' + (start // {DAY})::INT) AS day, n_events
+    FROM spans WHERE kind = 0
+    """)
+    # Purchases (a few % of events), each tied to its session: the latest start at or before it.
+    con.execute(f"""
+    CREATE TABLE purch AS
+    SELECT e.person, s.sno, s.day, e.price, e.product_id
+    FROM (SELECT coalesce(m.person, k.user_id) AS person, k.ts, k.price, k.product_id
+          FROM ev_kept k LEFT JOIN idmap m ON m.id = k.user_id WHERE k.is_p) e
+    ASOF JOIN sess s ON e.person = s.person AND e.ts >= s.start
+    """)
+    con.execute("DROP TABLE ev_kept")
+    con.execute("CREATE TABLE sess_rev AS SELECT person, sno, sum(price) AS revenue FROM purch GROUP BY person, sno")
+    log(f"sessions: {con.execute('SELECT count(*) FROM sess').fetchone()[0]}")
 
-# Person for each click (linked IDs map to their component's name).
-con.execute("""
-CREATE TABLE clk AS
-SELECT coalesce(m.person, c.user_id) AS person, c.click_id, c.campaign_id, c.ts
-FROM clk_raw c LEFT JOIN idmap m ON m.id = c.user_id
-""")
-con.execute("DROP TABLE clk_raw")
 
-# Credit: latest click at or before the start, within 7 days; ties -> smallest click_id.
-con.execute(f"""
-CREATE TABLE credit AS
-WITH cpt AS (
-    SELECT person, ts, arg_min(campaign_id, click_id) AS campaign_id FROM clk GROUP BY person, ts
-)
-SELECT x.day, r.revenue IS NOT NULL AS has_p, coalesce(r.revenue, 0) AS revenue, x.campaign_id
-FROM (
-    SELECT s.person, s.sno, s.day,
-           CASE WHEN c.ts IS NOT NULL AND s.start - c.ts <= {WEEK} THEN c.campaign_id ELSE 'organic' END AS campaign_id
-    FROM sess s ASOF LEFT JOIN cpt c ON s.person = c.person AND s.start >= c.ts
-) x LEFT JOIN sess_rev r ON r.person = x.person AND r.sno = x.sno
-""")
+def build_clk(con):
+    """clk(person, click_id, campaign_id, ts)."""
+    # Person for each click (linked IDs map to their component's name).
+    con.execute("""
+    CREATE TABLE clk AS
+    SELECT coalesce(m.person, c.user_id) AS person, c.click_id, c.campaign_id, c.ts
+    FROM clk_raw c LEFT JOIN idmap m ON m.id = c.user_id
+    """)
+    con.execute("DROP TABLE clk_raw")
 
-# Assists. A click covers session starts in [ts, ts + 7d]; per (person, campaign)
-# the covers are merged into disjoint intervals with frame-free windows (keep the
-# rows that open or close a run of clicks under 7 days apart, pair them with lead).
-# Two ASOF joins turn an interval into the range [a, b] of session numbers whose
-# start falls inside. Session numbers are consecutive per person and days never
-# decrease along them, so instead of expanding every session in [a, b], each
-# interval adds its overlap with each of the person's per-day session ranges.
-con.execute(f"""
-CREATE TABLE assist AS
-WITH ct AS (SELECT DISTINCT person, campaign_id, ts FROM clk),
-w AS (
-    SELECT person, campaign_id, ts, lag(ts) OVER o AS prev, lead(ts) OVER o AS nxt
-    FROM ct WINDOW o AS (PARTITION BY person, campaign_id ORDER BY ts)
-),
-b AS (
-    SELECT person, campaign_id, ts,
-           prev IS NULL OR ts - prev > {WEEK} AS opens,
-           nxt IS NULL OR nxt - ts > {WEEK} AS closes
-    FROM w WHERE prev IS NULL OR ts - prev > {WEEK} OR nxt IS NULL OR nxt - ts > {WEEK}
-),
-iv AS (
-    -- an opening row is paired with the closing row of its run: itself, or the next kept row
-    SELECT person, campaign_id, lo, hi + {WEEK} AS hi FROM (
-        SELECT person, campaign_id, opens, ts AS lo,
-               CASE WHEN closes THEN ts ELSE lead(ts) OVER o END AS hi
-        FROM b WINDOW o AS (PARTITION BY person, campaign_id ORDER BY ts)
-    ) WHERE opens
-),
-ab AS (
-    SELECT x.person, x.campaign_id, x.first_s, s.sno AS last_s FROM (
-        SELECT iv.*, s.sno AS first_s FROM iv ASOF JOIN sess s ON iv.person = s.person AND iv.lo <= s.start
-    ) x ASOF JOIN sess s ON x.person = s.person AND x.hi >= s.start
-    WHERE x.first_s <= s.sno
-),
-pd AS (SELECT person, day, min(sno) AS lo, max(sno) AS hi FROM sess GROUP BY person, day)
-SELECT ab.campaign_id, pd.day,
-       sum(least(ab.last_s, pd.hi) - greatest(ab.first_s, pd.lo) + 1) AS assisted_sessions
-FROM ab JOIN pd ON pd.person = ab.person AND pd.lo <= ab.last_s AND pd.hi >= ab.first_s
-GROUP BY ab.campaign_id, pd.day
-""")
+
+def build_credit(con):
+    """credit(day, has_p, revenue, campaign_id): one row per session."""
+    # Credit: latest click at or before the start, within 7 days; ties -> smallest click_id.
+    con.execute(f"""
+    CREATE TABLE credit AS
+    WITH cpt AS (
+        SELECT person, ts, arg_min(campaign_id, click_id) AS campaign_id FROM clk GROUP BY person, ts
+    )
+    SELECT x.day, r.revenue IS NOT NULL AS has_p, coalesce(r.revenue, 0) AS revenue, x.campaign_id
+    FROM (
+        SELECT s.person, s.sno, s.day,
+               CASE WHEN c.ts IS NOT NULL AND s.start - c.ts <= {WEEK} THEN c.campaign_id ELSE 'organic' END AS campaign_id
+        FROM sess s ASOF LEFT JOIN cpt c ON s.person = c.person AND s.start >= c.ts
+    ) x LEFT JOIN sess_rev r ON r.person = x.person AND r.sno = x.sno
+    """)
+
+
+def build_assist(con):
+    """assist(campaign_id, day, assisted_sessions)."""
+    # Assists. A click covers session starts in [ts, ts + 7d]; per (person, campaign)
+    # the covers are merged into disjoint intervals with frame-free windows (keep the
+    # rows that open or close a run of clicks under 7 days apart, pair them with lead).
+    # Two ASOF joins turn an interval into the range [a, b] of session numbers whose
+    # start falls inside. Session numbers are consecutive per person and days never
+    # decrease along them, so instead of expanding every session in [a, b], each
+    # interval adds its overlap with each of the person's per-day session ranges.
+    con.execute(f"""
+    CREATE TABLE assist AS
+    WITH ct AS (SELECT DISTINCT person, campaign_id, ts FROM clk),
+    w AS (
+        SELECT person, campaign_id, ts, lag(ts) OVER o AS prev, lead(ts) OVER o AS nxt
+        FROM ct WINDOW o AS (PARTITION BY person, campaign_id ORDER BY ts)
+    ),
+    b AS (
+        SELECT person, campaign_id, ts,
+               prev IS NULL OR ts - prev > {WEEK} AS opens,
+               nxt IS NULL OR nxt - ts > {WEEK} AS closes
+        FROM w WHERE prev IS NULL OR ts - prev > {WEEK} OR nxt IS NULL OR nxt - ts > {WEEK}
+    ),
+    iv AS (
+        -- an opening row is paired with the closing row of its run: itself, or the next kept row
+        SELECT person, campaign_id, lo, hi + {WEEK} AS hi FROM (
+            SELECT person, campaign_id, opens, ts AS lo,
+                   CASE WHEN closes THEN ts ELSE lead(ts) OVER o END AS hi
+            FROM b WINDOW o AS (PARTITION BY person, campaign_id ORDER BY ts)
+        ) WHERE opens
+    ),
+    ab AS (
+        SELECT x.person, x.campaign_id, x.first_s, s.sno AS last_s FROM (
+            SELECT iv.*, s.sno AS first_s FROM iv ASOF JOIN sess s ON iv.person = s.person AND iv.lo <= s.start
+        ) x ASOF JOIN sess s ON x.person = s.person AND x.hi >= s.start
+        WHERE x.first_s <= s.sno
+    ),
+    pd AS (SELECT person, day, min(sno) AS lo, max(sno) AS hi FROM sess GROUP BY person, day)
+    SELECT ab.campaign_id, pd.day,
+           sum(least(ab.last_s, pd.hi) - greatest(ab.first_s, pd.lo) + 1) AS assisted_sessions
+    FROM ab JOIN pd ON pd.person = ab.person AND pd.lo <= ab.last_s AND pd.hi >= ab.first_s
+    GROUP BY ab.campaign_id, pd.day
+    """)
+
 
 # ---------------------------------------------------------------- outputs
 ud_dir = os.path.join(OUT, "user_daily")
@@ -431,24 +443,31 @@ cd_dir = os.path.join(OUT, "campaign_daily")
 os.makedirs(ud_dir, exist_ok=True)
 os.makedirs(cd_dir, exist_ok=True)
 
-con.execute(f"""
-COPY (
-    WITH base AS (
-        SELECT person, day, count(*) AS sessions, sum(n_events) AS events FROM sess GROUP BY person, day
-    ), cat AS (
-        SELECT e.person, e.day, coalesce(p.category, 'unknown') AS category, sum(e.price) AS amt
-        FROM purch e LEFT JOIN products p ON p.product_id = e.product_id
-        GROUP BY ALL
-    ), top AS (
-        SELECT person, day, arg_min(category, (-amt, category)) AS top_category, sum(amt) AS revenue_cents
-        FROM cat GROUP BY person, day
-    )
-    SELECT b.person AS user_id, b.day, b.sessions::BIGINT AS sessions, b.events::BIGINT AS events,
-           coalesce(t.revenue_cents, 0)::BIGINT AS revenue_cents, t.top_category
-    FROM base b LEFT JOIN top t USING (person, day)
-) TO '{os.path.join(ud_dir, "part-0.parquet")}' (FORMAT parquet)
-""")
-log("wrote user_daily")
+def write_user_daily(con):
+    """Write /output/user_daily."""
+    con.execute(f"""
+    COPY (
+        WITH base AS (
+            SELECT person, day, count(*) AS sessions, sum(n_events) AS events FROM sess GROUP BY person, day
+        ), cat AS (
+            SELECT e.person, e.day, coalesce(p.category, 'unknown') AS category, sum(e.price) AS amt
+            FROM purch e LEFT JOIN products p ON p.product_id = e.product_id
+            GROUP BY ALL
+        ), top AS (
+            SELECT person, day, arg_min(category, (-amt, category)) AS top_category, sum(amt) AS revenue_cents
+            FROM cat GROUP BY person, day
+        )
+        SELECT b.person AS user_id, b.day, b.sessions::BIGINT AS sessions, b.events::BIGINT AS events,
+               coalesce(t.revenue_cents, 0)::BIGINT AS revenue_cents, t.top_category
+        FROM base b LEFT JOIN top t USING (person, day)
+    ) TO '{os.path.join(ud_dir, "part-0.parquet")}' (FORMAT parquet)
+    """)
+    log("wrote user_daily")
+
+
+run_parallel(build_sessions, build_clk)
+run_parallel(build_credit, build_assist, write_user_daily)
+
 
 con.execute(f"""
 COPY (
