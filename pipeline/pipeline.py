@@ -248,7 +248,7 @@ WITH raw AS (
     WHERE event_id IS NOT NULL
 ), typed AS (
     SELECT event_id, user_id, product_id, event_type = 'purchase' AS is_p,
-           parse_ts(ts) AS t, epoch_ms(strptime(ingest_ts, '%Y-%m-%dT%H:%M:%SZ')) AS ing,
+           parse_ts(ts) AS t, epoch_ms(try_strptime(ingest_ts, '%Y-%m-%dT%H:%M:%SZ')) AS ing,
            CASE WHEN event_type = 'purchase' AND regexp_full_match(price_cents, '[0-9]+')
                 THEN TRY_CAST(ltrim(price_cents, '0') AS BIGINT) END AS price,
            event_type

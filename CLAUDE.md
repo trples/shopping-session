@@ -27,5 +27,15 @@ At most 4,096 processes and threads, and at most 50 MB on stdout (log to stderr)
   - `python3 scripts/run_fixtures.py fixtures -- python3 pipeline/pipeline.py` (36/36 edge cases)
   - `scripts/gen.py` (an approximate local generator) plus `scripts/reference.py` (an independent
     pure-Python implementation), diffed with `scripts/compare.py OUT REF`.
-- DuckDB's CSV reader treats `\r` as a line break. Files containing `\r` (or `\x01`, the line
-  reader's delimiter) go through a byte-exact `read_text` path instead.
+  - For scale: `scripts/gen.py` at 6M events, then replicate ×10 with distinct IDs to reach ~60M,
+    and diff each speed change against a baseline output of an earlier, verified version.
+- DuckDB's CSV reader treats `\r` as a line break. Files containing `\r` (or `\x02`, the fast
+  reader's null string) go through a byte-exact `read_text` + regex path instead.
+- Fast path: `read_csv` with `quote=''`, one extra sentinel column, `null_padding`, `strict_mode`,
+  `ignore_errors`, `nullstr='\x02'`, so field counts are exact; quotes are checked per field.
+- Speed lessons (60M events, 8 threads, M-series Mac: 45s first version -> ~23-26s):
+  - Dedup: `QUALIFY row_number()` beats `arg_min(struct)` group-by by 2-3x.
+  - Windows with frames (`ROWS UNBOUNDED PRECEDING`) over 54M rows are ~3x slower than
+    frame-free `lag`/`lead`/`row_number`; sessionize with those only.
+  - Tried and rejected: replace-based quote stripping, whole-line regex on concat_ws.
+- `PROFILE_DIR=dir` writes DuckDB operator timings per statement (times are CPU, summed over threads).
