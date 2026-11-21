@@ -44,11 +44,20 @@ At most 4,096 processes and threads, and at most 50 MB on stdout (log to stderr)
   `ignore_errors`, `nullstr='\x02'`, so field counts are exact; quotes are checked per field.
 - Current local times (8 threads, M-series Mac): public 1M dev set ~0.5s (MATCH); real 60M ~27s.
   The submission's first gate is the 1M dev set, so small-input overheads matter.
-- Rust engine, same Mac: dev set ~0.22s, real 15M ~1.2s (DuckDB 5.9s), real 60M ~11-14s but
-  that Mac was swapping; CPU-bound estimate ~5s.
+- Rust engine, same Mac: dev set ~0.07s, real 15M ~0.6s (DuckDB 5.9s). Real 60M can't be
+  timed well there (the Mac swaps); linear estimate ~2.5s on that Mac.
+- `cargo test --release` in engine/ fuzzes the SWAR tokenizer against the per-line reference
+  parser (600k random chunks) and checks timestamp edge cases. Run it after touching parsing.
 - Rust engine lessons: copy short IDs inline into records while parsing (the zero-copy version
   re-read the 5GB mmap randomly and was page-fault bound, 110s); scatter by counting sort into
   one buffer per chunk instead of hundreds of growing Vecs.
+  - 16-byte keys (<=15 bytes inline) hashed/compared as two words.
+  - Linked IDs resolved per bucket(user) against a small slice of the link map (one global
+    3.6M-entry map meant a cache miss per record). Union-find runs on integers after
+    parallel per-bucket numbering (it was the critical path at 60M).
+  - Session phase groups by counting sort, then sorts each person's slice by time.
+  - Tokenizer: SWAR 8-byte masks for , " \n beat memchr3_iter (hits every ~8 bytes).
+  - Tried and rejected: mimalloc (slower), MAP_POPULATE / WillNeed (serialize faulting).
 - DuckDB speed lessons:
   - Dedup: `QUALIFY row_number()` beats `arg_min(struct)` group-by by 2-3x.
   - Windows with frames (`ROWS UNBOUNDED PRECEDING`) over 54M rows are ~3x slower than
