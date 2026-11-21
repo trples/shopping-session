@@ -56,7 +56,7 @@ def find_slow_files(files):
         return
     lst = "[" + ",".join(sql_str(f) for f in files) + "]"
     for (name,) in con.execute(f"SELECT filename FROM read_text({lst}) "
-                               f"WHERE strpos(content, chr(13)) > 0 OR strpos(content, chr(2)) > 0").fetchall():
+                               f"WHERE contains(content, chr(13)) OR contains(content, chr(2))").fetchall():
         SLOW_FILES.add(os.path.abspath(name))
 
 
@@ -125,7 +125,10 @@ if os.environ.get("PROFILE_DIR"):
     con = Profiled(con, os.environ["PROFILE_DIR"])
 con.execute(f"SET threads = {NCPU}")
 con.execute(f"SET memory_limit = '{max(1, int(MEM_GB * 0.75))}GB'")
-os.makedirs(os.path.join(SCRATCH, 'duckdb_tmp'), exist_ok=True)
+try:
+    os.makedirs(os.path.join(SCRATCH, 'duckdb_tmp'), exist_ok=True)
+except OSError:
+    pass
 con.execute(f"SET temp_directory = '{os.path.join(SCRATCH, 'duckdb_tmp')}'")
 con.execute("SET preserve_insertion_order = false")
 
@@ -267,21 +270,41 @@ WHERE k.ok
 """)
 log(f"events valid: {con.execute('SELECT count(*) FROM ev').fetchone()[0]}")
 
-# Sessionize per person.
-con.execute(f"""
-CREATE TABLE evs AS
-SELECT person, ts, is_p, price, product_id,
-       (sum(nw) OVER (PARTITION BY person ORDER BY ts ROWS UNBOUNDED PRECEDING))::BIGINT AS sno
-FROM (SELECT *, CASE WHEN ts - lag(ts) OVER (PARTITION BY person ORDER BY ts) <= {GAP} THEN 0 ELSE 1 END AS nw
-      FROM ev)
-""")
-con.execute("DROP TABLE ev")
+# Sessionize per person in one sort, with frame-free window functions only. Each
+# event gets its previous/next ts and row number; only session starts (first event,
+# or gap > 30 min) and each person's last event are kept, and a session's event
+# count is the row-number difference to the boundary after it. Equal timestamps
+# have gap 0 and so share a session.
 con.execute(f"""
 CREATE TABLE sess AS
-SELECT person, sno, min(ts) AS start, (DATE '1970-01-01' + (min(ts) // {DAY})::INT) AS day,
-       count(*) AS n_events, coalesce(sum(price), 0) AS revenue, bool_or(is_p) AS has_p
-FROM evs GROUP BY person, sno
+WITH w AS (
+    SELECT person, ts, lag(ts) OVER o AS prev, lead(ts) OVER o AS nxt, row_number() OVER o AS rn
+    FROM ev WINDOW o AS (PARTITION BY person ORDER BY ts)
+), edges AS (
+    -- kind 0: a session start, with the count of events before it
+    -- kind 1: the person's last event, with the count through it
+    SELECT person, ts, kind, CASE WHEN kind = 0 THEN rn - 1 ELSE rn END AS c_n
+    FROM (SELECT *, unnest(CASE WHEN is_start AND nxt IS NULL THEN [0, 1]
+                                WHEN is_start THEN [0] ELSE [1] END) AS kind
+          FROM (SELECT *, (prev IS NULL OR ts - prev > {GAP}) AS is_start FROM w)
+          WHERE is_start OR nxt IS NULL)
+), spans AS (
+    SELECT person, ts AS start, kind, lead(c_n) OVER o - c_n AS n_events,
+           sum(1 - kind) OVER (o ROWS UNBOUNDED PRECEDING) AS sno
+    FROM edges WINDOW o AS (PARTITION BY person ORDER BY c_n)
+)
+SELECT person, sno::BIGINT AS sno, start, (DATE '1970-01-01' + (start // {DAY})::INT) AS day, n_events
+FROM spans WHERE kind = 0
 """)
+# Purchases (a few % of events), each tied to its session: the latest start at or before it.
+con.execute("""
+CREATE TABLE purch AS
+SELECT e.person, s.sno, s.day, e.price, e.product_id
+FROM (SELECT person, ts, price, product_id FROM ev WHERE is_p) e
+ASOF JOIN sess s ON e.person = s.person AND e.ts >= s.start
+""")
+con.execute("DROP TABLE ev")
+con.execute("CREATE TABLE sess_rev AS SELECT person, sno, sum(price) AS revenue FROM purch GROUP BY person, sno")
 log(f"sessions: {con.execute('SELECT count(*) FROM sess').fetchone()[0]}")
 
 # ---------------------------------------------------------------- clicks
@@ -290,10 +313,11 @@ CREATE TABLE clk AS
 WITH raw AS (
     SELECT * FROM ({parsed_sql(csv_files('clicks'), ['click_id', 'user_id', 'campaign_id', 'ts'])})
     WHERE click_id IS NOT NULL
-), dd AS (
-    SELECT click_id, any_value(struct_pack(user_id, campaign_id, ts)) AS r FROM raw GROUP BY click_id
 ), typed AS (
-    SELECT click_id, r.user_id, r.campaign_id, parse_ts(r.ts) AS ts FROM dd
+    -- No dedup on click_id: copies of a click are identical (rules), and every use
+    -- below (latest click with smallest id, distinct campaigns, distinct
+    -- (person, campaign, ts)) gives the same answer with or without copies.
+    SELECT click_id, user_id, campaign_id, parse_ts(ts) AS ts FROM raw
 )
 SELECT coalesce(m.person, t.user_id) AS person, t.click_id, t.campaign_id, t.ts
 FROM typed t LEFT JOIN idmap m ON m.id = t.user_id
@@ -308,9 +332,12 @@ CREATE TABLE credit AS
 WITH cpt AS (
     SELECT person, ts, arg_min(campaign_id, click_id) AS campaign_id FROM clk GROUP BY person, ts
 )
-SELECT s.day, s.has_p, s.revenue,
-       CASE WHEN c.ts IS NOT NULL AND s.start - c.ts <= {WEEK} THEN c.campaign_id ELSE 'organic' END AS campaign_id
-FROM sess s ASOF LEFT JOIN cpt c ON s.person = c.person AND s.start >= c.ts
+SELECT x.day, r.revenue IS NOT NULL AS has_p, coalesce(r.revenue, 0) AS revenue, x.campaign_id
+FROM (
+    SELECT s.person, s.sno, s.day,
+           CASE WHEN c.ts IS NOT NULL AND s.start - c.ts <= {WEEK} THEN c.campaign_id ELSE 'organic' END AS campaign_id
+    FROM sess s ASOF LEFT JOIN cpt c ON s.person = c.person AND s.start >= c.ts
+) x LEFT JOIN sess_rev r ON r.person = x.person AND r.sno = x.sno
 """)
 
 # Assists: merge each (person, campaign)'s click coverage [ts, ts + 7d] into disjoint
@@ -344,19 +371,17 @@ os.makedirs(cd_dir, exist_ok=True)
 con.execute(f"""
 COPY (
     WITH base AS (
-        SELECT person, day, count(*) AS sessions, sum(n_events) AS events, sum(revenue) AS revenue_cents
-        FROM sess GROUP BY person, day
+        SELECT person, day, count(*) AS sessions, sum(n_events) AS events FROM sess GROUP BY person, day
     ), cat AS (
-        SELECT e.person, s.day, coalesce(p.category, 'unknown') AS category, sum(e.price) AS amt
-        FROM evs e JOIN sess s ON s.person = e.person AND s.sno = e.sno
-        LEFT JOIN products p ON p.product_id = e.product_id
-        WHERE e.is_p
+        SELECT e.person, e.day, coalesce(p.category, 'unknown') AS category, sum(e.price) AS amt
+        FROM purch e LEFT JOIN products p ON p.product_id = e.product_id
         GROUP BY ALL
     ), top AS (
-        SELECT person, day, arg_min(category, (-amt, category)) AS top_category FROM cat GROUP BY person, day
+        SELECT person, day, arg_min(category, (-amt, category)) AS top_category, sum(amt) AS revenue_cents
+        FROM cat GROUP BY person, day
     )
     SELECT b.person AS user_id, b.day, b.sessions::BIGINT AS sessions, b.events::BIGINT AS events,
-           b.revenue_cents::BIGINT AS revenue_cents, t.top_category
+           coalesce(t.revenue_cents, 0)::BIGINT AS revenue_cents, t.top_category
     FROM base b LEFT JOIN top t USING (person, day)
 ) TO '{os.path.join(ud_dir, "part-0.parquet")}' (FORMAT parquet)
 """)
