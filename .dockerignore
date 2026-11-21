@@ -1,2 +1,5 @@
 *
-!pipeline/pipeline.py
+!engine/Cargo.toml
+!engine/Cargo.lock
+!engine/.cargo
+!engine/src

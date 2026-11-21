@@ -22,7 +22,12 @@ At most 4,096 processes and threads, and at most 50 MB on stdout (log to stderr)
 
 - The exact rules are the organizers' `rules.md` (not checked in here). They win over everything else;
   `fixtures/README.md` summarizes the edge cases.
-- `pipeline/pipeline.py` is the whole solution (DuckDB). The `Dockerfile` copies only that file.
+- The submitted solution is the native Rust engine in `engine/` (`engine/src/main.rs`); the
+  `Dockerfile` builds it in `rust:1.91-slim-bookworm` and ships only the binary on
+  `debian:bookworm-slim`. `pipeline/pipeline.py` (DuckDB) is the previous solution, kept as a
+  second, independent implementation to diff against.
+- Build locally: `cd engine && cargo build --release`; run the binary with DATA_DIR/OUTPUT_DIR set.
+  Fixtures: `python3 scripts/run_fixtures.py fixtures -- engine/target/release/shopping`.
 - Correctness checks, all of which must pass before any speed change is kept:
   - `python3 scripts/run_fixtures.py fixtures -- python3 pipeline/pipeline.py` (36/36 edge cases)
   - `scripts/gen.py` (an approximate local generator) plus `scripts/reference.py` (an independent
@@ -39,7 +44,12 @@ At most 4,096 processes and threads, and at most 50 MB on stdout (log to stderr)
   `ignore_errors`, `nullstr='\x02'`, so field counts are exact; quotes are checked per field.
 - Current local times (8 threads, M-series Mac): public 1M dev set ~0.5s (MATCH); real 60M ~27s.
   The submission's first gate is the 1M dev set, so small-input overheads matter.
-- Speed lessons:
+- Rust engine, same Mac: dev set ~0.22s, real 15M ~1.2s (DuckDB 5.9s), real 60M ~11-14s but
+  that Mac was swapping; CPU-bound estimate ~5s.
+- Rust engine lessons: copy short IDs inline into records while parsing (the zero-copy version
+  re-read the 5GB mmap randomly and was page-fault bound, 110s); scatter by counting sort into
+  one buffer per chunk instead of hundreds of growing Vecs.
+- DuckDB speed lessons:
   - Dedup: `QUALIFY row_number()` beats `arg_min(struct)` group-by by 2-3x.
   - Windows with frames (`ROWS UNBOUNDED PRECEDING`) over 54M rows are ~3x slower than
     frame-free `lag`/`lead`/`row_number`; sessionize with those only.

@@ -1,0 +1,4 @@
+# The scorers are Intel Xeon, Cascade Lake or newer: AVX2 is always there.
+# Applies only when building for x86-64 Linux, so other builds are unaffected.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

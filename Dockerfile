@@ -1,6 +1,10 @@
-FROM python:3.12-slim-bookworm
-RUN pip install --no-cache-dir duckdb==1.5.6
-COPY pipeline/pipeline.py /app/pipeline.py
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 TMPDIR=/scratch
+# Build the native pipeline, then ship only the binary.
+FROM rust:1.91-slim-bookworm AS build
+WORKDIR /src
+COPY engine/ ./
+RUN cargo build --release --locked
+
+FROM debian:bookworm-slim
+COPY --from=build /src/target/release/shopping /usr/local/bin/shopping
 USER 1000:1000
-CMD ["python3", "/app/pipeline.py"]
+CMD ["/usr/local/bin/shopping"]
