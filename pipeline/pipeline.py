@@ -9,6 +9,7 @@ Temp   $SCRATCH_DIR (default /scratch)
 import json
 import os
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -119,6 +120,9 @@ class Profiled:
             self.con.execute(f"SET profiling_output = '{self.dir}/{self.n:02d}.txt'")
         return self.con.execute(q, *a)
 
+    def cursor(self):
+        return self
+
 
 con = duckdb.connect()
 if os.environ.get("PROFILE_DIR"):
@@ -145,39 +149,25 @@ find_slow_files(csv_files("events") + csv_files("clicks") + csv_files("links")
 log(f"files needing the exact reader: {len(SLOW_FILES)}")
 
 # ---------------------------------------------------------------- timestamp macros
-con.execute("""
-CREATE MACRO days_civ(y, m, d) AS (
-    ((y - (m <= 2)::INT) // 400) * 146097
-    + ((y - (m <= 2)::INT) % 400) * 365
-    + ((y - (m <= 2)::INT) % 400) // 4
-    - ((y - (m <= 2)::INT) % 400) // 100
-    + (153 * (m + CASE WHEN m > 2 THEN -3 ELSE 9 END) + 2) // 5 + d - 1
-    - 719468)
-""")
-con.execute("""
-CREATE MACRO dim(y, m) AS CASE
-    WHEN m = 2 THEN CASE WHEN (y % 4 = 0 AND y % 100 <> 0) OR y % 400 = 0 THEN 29 ELSE 28 END
-    WHEN m IN (4, 6, 9, 11) THEN 30 ELSE 31 END
-""")
-con.execute("""
-CREATE MACRO civ_ms(y, mo, d, h, mi, se) AS CASE
-    WHEN mo BETWEEN 1 AND 12 AND d BETWEEN 1 AND dim(y, mo) AND h <= 23 AND mi <= 59 AND se <= 59
-    THEN (days_civ(y, mo, d) * 86400 + h * 3600 + mi * 60 + se) * 1000 END
-""")
-con.execute("""
-CREATE MACRO iso_ms(s) AS civ_ms(substr(s, 1, 4)::BIGINT, substr(s, 6, 2)::BIGINT, substr(s, 9, 2)::BIGINT,
-                                 substr(s, 12, 2)::BIGINT, substr(s, 15, 2)::BIGINT, substr(s, 18, 2)::BIGINT)
+# F1/F2: the regex fixes the shape; hour/minute/second ranges are checked as
+# two-digit strings, and DuckDB's own timestamp cast does the calendar (it rejects
+# month 13, Feb 30, Feb 29 outside leap years). Checked equal to an independent
+# civil-date implementation on ~4M crafted strings (all years 0001-9999 tested).
+con.execute(r"""
+CREATE MACRO ts_base(s) AS CASE
+    WHEN substr(s, 12, 2) <= '23' AND substr(s, 15, 2) <= '59' AND substr(s, 18, 2) <= '59'
+    THEN epoch_ms(TRY_CAST(substr(s, 1, 19) AS TIMESTAMP)) END
 """)
 con.execute(r"""
 CREATE MACRO parse_ts(s) AS CASE
     WHEN regexp_full_match(s, '[0-9]+') THEN TRY_CAST(ltrim(s, '0') AS BIGINT)
     WHEN length(s) = 20 AND regexp_full_match(s, '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z')
-        THEN iso_ms(s)
+        THEN ts_base(s)
     WHEN length(s) = 25
          AND regexp_full_match(s, '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{2}:[0-9]{2}')
-         AND substr(s, 21, 2)::INT <= 23 AND substr(s, 24, 2)::INT <= 59
-        THEN iso_ms(s) - CASE WHEN substr(s, 20, 1) = '+' THEN 1 ELSE -1 END
-                         * (substr(s, 21, 2)::BIGINT * 3600 + substr(s, 24, 2)::BIGINT * 60) * 1000
+         AND substr(s, 21, 2) <= '23' AND substr(s, 24, 2) <= '59'
+        THEN ts_base(s) - CASE WHEN substr(s, 20, 1) = '+' THEN 1 ELSE -1 END
+                         * (substr(s, 21, 2)::BIGINT * 60 + substr(s, 24, 2)::BIGINT) * 60000
     END
 """)
 
@@ -189,86 +179,150 @@ con.execute(f"CREATE TABLE campaigns AS SELECT campaign_id, any_value(channel) A
             f"({parsed_sql([os.path.join(DATA, 'campaigns.csv')], ['campaign_id', 'channel'])}) "
             f"WHERE campaign_id IS NOT NULL GROUP BY campaign_id")
 
-# ---------------------------------------------------------------- linked IDs
-con.execute(f"CREATE TABLE links_raw AS SELECT a, b FROM ({parsed_sql(csv_files('links'), ['a', 'b'])}) "
-            f"WHERE a IS NOT NULL AND b IS NOT NULL")
-# Integer ids in byte order of the string ids, so the smallest int names the person.
-con.execute("""
-CREATE TABLE ids AS
-SELECT id, (row_number() OVER (ORDER BY id))::INT AS n
-FROM (SELECT a AS id FROM links_raw UNION SELECT b FROM links_raw)
-""")
-con.execute("""
-CREATE TABLE edges AS
-SELECT DISTINCT u, v FROM (
-    SELECT ia.n AS u, ib.n AS v FROM links_raw JOIN ids ia ON ia.id = a JOIN ids ib ON ib.id = b
-    UNION ALL
-    SELECT ib.n, ia.n FROM links_raw JOIN ids ia ON ia.id = a JOIN ids ib ON ib.id = b
-) WHERE u <> v
-""")
-con.execute("CREATE TABLE lab AS SELECT n AS v, n AS l FROM ids")
-it = 0
-while True:
-    it += 1
-    # Hook: every vertex and its current label take the smallest neighbour label;
-    # then shortcut (pointer jumping) twice. Labels only ever decrease and stay
-    # within the component, and the fixed point is the component minimum.
+# ---------------------------------------------------------------- the three independent inputs
+def build_links(con):
+    """Linked IDs -> idmap(id, person)."""
+    con.execute(f"CREATE TABLE links_raw AS SELECT a, b FROM ({parsed_sql(csv_files('links'), ['a', 'b'])}) "
+                f"WHERE a IS NOT NULL AND b IS NOT NULL")
+    # Integer ids in byte order of the string ids, so the smallest int names the person.
     con.execute("""
-    CREATE OR REPLACE TABLE lab2 AS
-    WITH cand AS (
-        SELECT v AS x, l AS c FROM lab
-        UNION ALL
-        SELECT e.u, lv.l FROM edges e JOIN lab lv ON lv.v = e.v
-        UNION ALL
-        SELECT lu.l, lv.l FROM edges e JOIN lab lu ON lu.v = e.u JOIN lab lv ON lv.v = e.v
-    ), m AS (SELECT x AS v, min(c) AS l FROM cand GROUP BY x),
-    j1 AS (SELECT a.v, b.l FROM m a JOIN m b ON b.v = a.l)
-    SELECT a.v, b.l FROM j1 a JOIN j1 b ON b.v = a.l
+    CREATE TABLE ids AS
+    SELECT id, (row_number() OVER (ORDER BY id))::INT AS n
+    FROM (SELECT a AS id FROM links_raw UNION SELECT b FROM links_raw)
     """)
-    changed = con.execute("SELECT count(*) FROM lab JOIN lab2 USING (v) WHERE lab.l <> lab2.l").fetchone()[0]
-    con.execute("DROP TABLE lab")
-    con.execute("ALTER TABLE lab2 RENAME TO lab")
-    if changed == 0:
-        break
-con.execute("""
-CREATE TABLE idmap AS
-SELECT i.id, r.id AS person FROM lab JOIN ids i ON i.n = lab.v JOIN ids r ON r.n = lab.l
-""")
-log(f"links: {con.execute('SELECT count(*) FROM idmap').fetchone()[0]} ids, {it} iterations")
+    con.execute("""
+    CREATE TABLE edges AS
+    SELECT DISTINCT u, v FROM (
+        SELECT ia.n AS u, ib.n AS v FROM links_raw JOIN ids ia ON ia.id = a JOIN ids ib ON ib.id = b
+        UNION ALL
+        SELECT ib.n, ia.n FROM links_raw JOIN ids ia ON ia.id = a JOIN ids ib ON ib.id = b
+    ) WHERE u <> v
+    """)
+    con.execute("CREATE TABLE lab AS SELECT n AS v, n AS l FROM ids")
+    it = 0
+    while True:
+        it += 1
+        # Hook: every vertex and its current label take the smallest neighbour label;
+        # then shortcut (pointer jumping) twice. Labels only ever decrease and stay
+        # within the component, and the fixed point is the component minimum.
+        con.execute("""
+        CREATE OR REPLACE TABLE lab2 AS
+        WITH cand AS (
+            SELECT v AS x, l AS c FROM lab
+            UNION ALL
+            SELECT e.u, lv.l FROM edges e JOIN lab lv ON lv.v = e.v
+            UNION ALL
+            SELECT lu.l, lv.l FROM edges e JOIN lab lu ON lu.v = e.u JOIN lab lv ON lv.v = e.v
+        ), m AS (SELECT x AS v, min(c) AS l FROM cand GROUP BY x),
+        j1 AS (SELECT a.v, b.l FROM m a JOIN m b ON b.v = a.l)
+        SELECT a.v, b.l FROM j1 a JOIN j1 b ON b.v = a.l
+        """)
+        changed = con.execute("SELECT count(*) FROM lab JOIN lab2 USING (v) WHERE lab.l <> lab2.l").fetchone()[0]
+        con.execute("DROP TABLE lab")
+        con.execute("ALTER TABLE lab2 RENAME TO lab")
+        if changed == 0:
+            break
+    con.execute("""
+    CREATE TABLE idmap AS
+    SELECT i.id, r.id AS person FROM lab JOIN ids i ON i.n = lab.v JOIN ids r ON r.n = lab.l
+    """)
+    log(f"links: {con.execute('SELECT count(*) FROM idmap').fetchone()[0]} ids, {it} iterations")
 
-# ---------------------------------------------------------------- events
-# Every parsed copy is typed and judged on its own (`ok`), then dedup keeps the
-# copy with the smallest ingest_ts and the event survives only if that copy is ok.
-# ingest_ts is always valid F1, so strptime parses it exactly.
-con.execute(f"""
-CREATE TABLE ev AS
-WITH raw AS (
-    SELECT * FROM ({parsed_sql(csv_files('events'),
-        ['event_id', 'user_id', 'ts', 'ingest_ts', 'event_type', 'product_id', 'price_cents'])})
-    WHERE event_id IS NOT NULL
-), typed AS (
-    SELECT event_id, user_id, product_id, event_type = 'purchase' AS is_p,
-           parse_ts(ts) AS t, epoch_ms(try_strptime(ingest_ts, '%Y-%m-%dT%H:%M:%SZ')) AS ing,
-           CASE WHEN event_type = 'purchase' AND regexp_full_match(price_cents, '[0-9]+')
-                THEN TRY_CAST(ltrim(price_cents, '0') AS BIGINT) END AS price,
-           event_type
-    FROM raw
-), judged AS (
-    SELECT event_id, ing, user_id, t, is_p, price, product_id,
-           coalesce(user_id IS NOT NULL AND t >= {WS} AND t < {WE}
-                    AND event_type IN ('view', 'cart', 'purchase') AND product_id IS NOT NULL
-                    AND (NOT is_p OR price BETWEEN 1 AND 10000000)
-                    AND ing - t <= {DAY}, false) AS ok
-    FROM typed
-), kept AS (
-    -- copies with equal ingest_ts are identical, so any one of them may win
-    SELECT * FROM judged QUALIFY row_number() OVER (PARTITION BY event_id ORDER BY ing) = 1
-)
-SELECT coalesce(m.person, k.user_id) AS person, k.t AS ts, k.is_p, k.price, k.product_id
-FROM kept k LEFT JOIN idmap m ON m.id = k.user_id
-WHERE k.ok
-""")
-log(f"events valid: {con.execute('SELECT count(*) FROM ev').fetchone()[0]}")
+
+# Parsed rows feed macros that name a column many times, and DuckDB inlines the
+# quote-stripping expression at every mention. Materializing the parsed rows
+# computes it once: a clear win on small inputs, a loss on very large ones (the
+# copy outweighs it). Results are identical either way.
+EVENT_BYTES = sum(os.path.getsize(f) for f in csv_files("events"))
+MAT = "MATERIALIZED " if EVENT_BYTES < (1 << 30) else ""
+
+
+def build_events(con):
+    """Events -> ev_kept(user_id, ts, is_p, price, product_id): deduped, valid."""
+    # Every parsed copy is typed and judged on its own (`ok`), then dedup keeps the
+    # copy with the smallest ingest_ts and the event survives only if that copy is ok.
+    # ingest_ts is parsed with the same exact parser (always valid F1 per the rules).
+    con.execute(f"""
+    CREATE TABLE ev_kept AS
+    WITH raw AS {MAT}(
+        SELECT * FROM ({parsed_sql(csv_files('events'),
+            ['event_id', 'user_id', 'ts', 'ingest_ts', 'event_type', 'product_id', 'price_cents'])})
+        WHERE event_id IS NOT NULL
+    ), typed AS (
+        SELECT event_id, user_id, product_id, event_type = 'purchase' AS is_p,
+               parse_ts(ts) AS t, parse_ts(ingest_ts) AS ing,
+               CASE WHEN event_type = 'purchase' AND regexp_full_match(price_cents, '[0-9]+')
+                    THEN TRY_CAST(ltrim(price_cents, '0') AS BIGINT) END AS price,
+               event_type
+        FROM raw
+    ), judged AS (
+        SELECT event_id, ing, user_id, t, is_p, price, product_id,
+               coalesce(user_id IS NOT NULL AND t >= {WS} AND t < {WE}
+                        AND event_type IN ('view', 'cart', 'purchase') AND product_id IS NOT NULL
+                        AND (NOT is_p OR price BETWEEN 1 AND 10000000)
+                        AND ing - t <= {DAY}, false) AS ok
+        FROM typed
+    ), kept AS (
+        -- copies with equal ingest_ts are identical, so any one of them may win
+        SELECT * FROM judged QUALIFY row_number() OVER (PARTITION BY event_id ORDER BY ing) = 1
+    )
+    SELECT user_id, t AS ts, is_p, price, product_id FROM kept WHERE ok
+    """)
+    log(f"events valid: {con.execute('SELECT count(*) FROM ev_kept').fetchone()[0]}")
+
+
+def build_clicks(con):
+    """Clicks -> clk_raw(user_id, click_id, campaign_id, ts): valid."""
+    con.execute(f"""
+    CREATE TABLE clk_raw AS
+    WITH raw AS {MAT}(
+        SELECT * FROM ({parsed_sql(csv_files('clicks'), ['click_id', 'user_id', 'campaign_id', 'ts'])})
+        WHERE click_id IS NOT NULL
+    ), typed AS (
+        -- No dedup on click_id: copies of a click are identical (rules), and every use
+        -- below (latest click with smallest id, distinct campaigns, distinct
+        -- (person, campaign, ts)) gives the same answer with or without copies.
+        SELECT click_id, user_id, campaign_id, parse_ts(ts) AS ts FROM raw
+    )
+    SELECT t.user_id, t.click_id, t.campaign_id, t.ts
+    FROM typed t
+    WHERE t.user_id IS NOT NULL AND t.ts >= {WS - WEEK} AND t.ts < {WE}
+      AND t.campaign_id IN (SELECT campaign_id FROM campaigns)
+    """)
+    log(f"clicks valid: {con.execute('SELECT count(*) FROM clk_raw').fetchone()[0]}")
+
+
+def run_parallel(*fns):
+    """Run independent steps at once on their own cursors. DuckDB releases the GIL
+    and schedules all of them on one shared thread pool, so small inputs no longer
+    leave threads idle. Profiling runs them one after another."""
+    if isinstance(con, Profiled):
+        for fn in fns:
+            fn(con)
+        return
+    errors = []
+
+    def wrap(fn):
+        try:
+            fn(con.cursor())
+        except BaseException as e:  # re-raised below, on the main thread
+            errors.append(e)
+
+    threads = [threading.Thread(target=wrap, args=(fn,)) for fn in fns]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if errors:
+        raise errors[0]
+
+
+run_parallel(build_links, build_events, build_clicks)
+
+# Person for each event (linked IDs map to their component's name), done inside
+# the two readers below instead of materializing another 60M-row table.
+EV = "(SELECT coalesce(m.person, k.user_id) AS person, k.ts, k.is_p, k.price, k.product_id " \
+     "FROM ev_kept k LEFT JOIN idmap m ON m.id = k.user_id)"
 
 # Sessionize per person in one sort, with frame-free window functions only. Each
 # event gets its previous/next ts and row number; only session starts (first event,
@@ -279,7 +333,7 @@ con.execute(f"""
 CREATE TABLE sess AS
 WITH w AS (
     SELECT person, ts, lag(ts) OVER o AS prev, lead(ts) OVER o AS nxt, row_number() OVER o AS rn
-    FROM ev WINDOW o AS (PARTITION BY person ORDER BY ts)
+    FROM {EV} WINDOW o AS (PARTITION BY person ORDER BY ts)
 ), edges AS (
     -- kind 0: a session start, with the count of events before it
     -- kind 1: the person's last event, with the count through it
@@ -297,34 +351,24 @@ SELECT person, sno::BIGINT AS sno, start, (DATE '1970-01-01' + (start // {DAY}):
 FROM spans WHERE kind = 0
 """)
 # Purchases (a few % of events), each tied to its session: the latest start at or before it.
-con.execute("""
+con.execute(f"""
 CREATE TABLE purch AS
 SELECT e.person, s.sno, s.day, e.price, e.product_id
-FROM (SELECT person, ts, price, product_id FROM ev WHERE is_p) e
+FROM (SELECT coalesce(m.person, k.user_id) AS person, k.ts, k.price, k.product_id
+      FROM ev_kept k LEFT JOIN idmap m ON m.id = k.user_id WHERE k.is_p) e
 ASOF JOIN sess s ON e.person = s.person AND e.ts >= s.start
 """)
-con.execute("DROP TABLE ev")
+con.execute("DROP TABLE ev_kept")
 con.execute("CREATE TABLE sess_rev AS SELECT person, sno, sum(price) AS revenue FROM purch GROUP BY person, sno")
 log(f"sessions: {con.execute('SELECT count(*) FROM sess').fetchone()[0]}")
 
-# ---------------------------------------------------------------- clicks
-con.execute(f"""
+# Person for each click (linked IDs map to their component's name).
+con.execute("""
 CREATE TABLE clk AS
-WITH raw AS (
-    SELECT * FROM ({parsed_sql(csv_files('clicks'), ['click_id', 'user_id', 'campaign_id', 'ts'])})
-    WHERE click_id IS NOT NULL
-), typed AS (
-    -- No dedup on click_id: copies of a click are identical (rules), and every use
-    -- below (latest click with smallest id, distinct campaigns, distinct
-    -- (person, campaign, ts)) gives the same answer with or without copies.
-    SELECT click_id, user_id, campaign_id, parse_ts(ts) AS ts FROM raw
-)
-SELECT coalesce(m.person, t.user_id) AS person, t.click_id, t.campaign_id, t.ts
-FROM typed t LEFT JOIN idmap m ON m.id = t.user_id
-WHERE t.user_id IS NOT NULL AND t.ts >= {WS - WEEK} AND t.ts < {WE}
-  AND t.campaign_id IN (SELECT campaign_id FROM campaigns)
+SELECT coalesce(m.person, c.user_id) AS person, c.click_id, c.campaign_id, c.ts
+FROM clk_raw c LEFT JOIN idmap m ON m.id = c.user_id
 """)
-log(f"clicks valid: {con.execute('SELECT count(*) FROM clk').fetchone()[0]}")
+con.execute("DROP TABLE clk_raw")
 
 # Credit: latest click at or before the start, within 7 days; ties -> smallest click_id.
 con.execute(f"""
@@ -340,26 +384,45 @@ FROM (
 ) x LEFT JOIN sess_rev r ON r.person = x.person AND r.sno = x.sno
 """)
 
-# Assists: merge each (person, campaign)'s click coverage [ts, ts + 7d] into disjoint
-# intervals, find the range of session numbers whose start falls inside, expand.
+# Assists. A click covers session starts in [ts, ts + 7d]; per (person, campaign)
+# the covers are merged into disjoint intervals with frame-free windows (keep the
+# rows that open or close a run of clicks under 7 days apart, pair them with lead).
+# Two ASOF joins turn an interval into the range [a, b] of session numbers whose
+# start falls inside. Session numbers are consecutive per person and days never
+# decrease along them, so instead of expanding every session in [a, b], each
+# interval adds its overlap with each of the person's per-day session ranges.
 con.execute(f"""
 CREATE TABLE assist AS
 WITH ct AS (SELECT DISTINCT person, campaign_id, ts FROM clk),
-g AS (
-    SELECT person, campaign_id, ts,
-           sum(CASE WHEN ts - prev <= {WEEK} THEN 0 ELSE 1 END)
-               OVER (PARTITION BY person, campaign_id ORDER BY ts ROWS UNBOUNDED PRECEDING) AS grp
-    FROM (SELECT *, lag(ts) OVER (PARTITION BY person, campaign_id ORDER BY ts) AS prev FROM ct)
+w AS (
+    SELECT person, campaign_id, ts, lag(ts) OVER o AS prev, lead(ts) OVER o AS nxt
+    FROM ct WINDOW o AS (PARTITION BY person, campaign_id ORDER BY ts)
 ),
-iv AS (SELECT person, campaign_id, min(ts) AS lo, max(ts) + {WEEK} AS hi FROM g GROUP BY person, campaign_id, grp),
-a AS (SELECT iv.*, s.sno AS first_s FROM iv ASOF JOIN sess s ON iv.person = s.person AND iv.lo <= s.start),
-b AS (SELECT a.*, s.sno AS last_s FROM a ASOF JOIN sess s ON a.person = s.person AND a.hi >= s.start),
-pairs AS (
-    SELECT person, campaign_id, unnest(range(first_s, last_s + 1)) AS sno FROM b WHERE first_s <= last_s
-)
-SELECT p.campaign_id, s.day, count(*) AS assisted_sessions
-FROM pairs p JOIN sess s ON s.person = p.person AND s.sno = p.sno
-GROUP BY p.campaign_id, s.day
+b AS (
+    SELECT person, campaign_id, ts,
+           prev IS NULL OR ts - prev > {WEEK} AS opens,
+           nxt IS NULL OR nxt - ts > {WEEK} AS closes
+    FROM w WHERE prev IS NULL OR ts - prev > {WEEK} OR nxt IS NULL OR nxt - ts > {WEEK}
+),
+iv AS (
+    -- an opening row is paired with the closing row of its run: itself, or the next kept row
+    SELECT person, campaign_id, lo, hi + {WEEK} AS hi FROM (
+        SELECT person, campaign_id, opens, ts AS lo,
+               CASE WHEN closes THEN ts ELSE lead(ts) OVER o END AS hi
+        FROM b WINDOW o AS (PARTITION BY person, campaign_id ORDER BY ts)
+    ) WHERE opens
+),
+ab AS (
+    SELECT x.person, x.campaign_id, x.first_s, s.sno AS last_s FROM (
+        SELECT iv.*, s.sno AS first_s FROM iv ASOF JOIN sess s ON iv.person = s.person AND iv.lo <= s.start
+    ) x ASOF JOIN sess s ON x.person = s.person AND x.hi >= s.start
+    WHERE x.first_s <= s.sno
+),
+pd AS (SELECT person, day, min(sno) AS lo, max(sno) AS hi FROM sess GROUP BY person, day)
+SELECT ab.campaign_id, pd.day,
+       sum(least(ab.last_s, pd.hi) - greatest(ab.first_s, pd.lo) + 1) AS assisted_sessions
+FROM ab JOIN pd ON pd.person = ab.person AND pd.lo <= ab.last_s AND pd.hi >= ab.first_s
+GROUP BY ab.campaign_id, pd.day
 """)
 
 # ---------------------------------------------------------------- outputs
