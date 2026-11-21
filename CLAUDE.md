@@ -27,6 +27,10 @@ At most 4,096 processes and threads, and at most 50 MB on stdout (log to stderr)
   - `python3 scripts/run_fixtures.py fixtures -- python3 pipeline/pipeline.py` (36/36 edge cases)
   - `scripts/gen.py` (an approximate local generator) plus `scripts/reference.py` (an independent
     pure-Python implementation), diffed with `scripts/compare.py OUT REF`.
+  - Real dev check: build `generator.zip` (Rust 1.85+, `cargo build --release`), then
+    `generate --seed 1 --events 1000000 --clicks 250000 --output dev`, unzip `dev-answer.zip`,
+    run the pipeline into `out/` and `python3 scripts/compare.py out dev-answer` (MATCH as of 1ba653f).
+    The real generator also makes a 60M set in ~7s (`--events 60000000 --clicks 15000000`): ~35s locally.
   - For scale: `scripts/gen.py` at 6M events, then replicate ×10 with distinct IDs to reach ~60M,
     and diff each speed change against a baseline output of an earlier, verified version.
 - DuckDB's CSV reader treats `\r` as a line break. Files containing `\r` (or `\x02`, the fast
