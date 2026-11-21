@@ -1,0 +1,8 @@
+# Datasets are mounted at run time; never commit data or outputs.
+dev/
+dev-answer/
+data/
+out/
+*.parquet
+.DS_Store
+__pycache__/
