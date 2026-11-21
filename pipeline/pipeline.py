@@ -7,7 +7,6 @@ Writes $OUTPUT_DIR  (default /output): user_daily/ and campaign_daily/ as Parque
 Temp   $SCRATCH_DIR (default /scratch)
 """
 import json
-import mmap
 import os
 import sys
 import time
@@ -44,31 +43,21 @@ def csv_files(sub):
                   if n.endswith(".csv") and os.path.isfile(os.path.join(d, n)))
 
 
-def needs_exact_reader(path):
-    """DuckDB's CSV reader treats a bare \\r as a line break, and our line reader
-    uses \\x01 as its (never expected) delimiter. Files holding either byte are
-    read byte-exactly with read_text instead. The generator writes neither."""
-    if os.path.getsize(path) == 0:
-        return False
-    with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
-        return m.find(b"\r") != -1 or m.find(b"\x01") != -1
+SLOW_FILES = set()
 
 
-def lines_sql(files):
-    """SQL yielding one row per data line (header skipped) with column `line`."""
-    fast = [f for f in files if not needs_exact_reader(f)]
-    slow = [f for f in files if f not in set(fast)]
-    parts = []
-    if fast:
-        lst = "[" + ",".join(sql_str(f) for f in fast) + "]"
-        parts.append(
-            f"SELECT line FROM read_csv({lst}, columns={{'line':'VARCHAR'}}, delim='\\x01', quote='', "
-            f"escape='', header=true, new_line='\\n', auto_detect=false, strict_mode=false)")
-    for f in slow:
-        parts.append(f"SELECT unnest(string_split(content, chr(10))[2:]) AS line FROM read_text({sql_str(f)})")
-    if not parts:
-        return "SELECT NULL::VARCHAR AS line WHERE false"
-    return " UNION ALL ".join(parts)
+def find_slow_files(files):
+    """DuckDB's CSV reader treats a bare \\r as a line break, and the fast reader
+    uses \\x02 as its null string. Files holding either byte are read
+    byte-exactly with read_text instead (the generator writes neither).
+    One parallel read_text scan finds them."""
+    files = [f for f in files if os.path.getsize(f) > 0]
+    if not files:
+        return
+    lst = "[" + ",".join(sql_str(f) for f in files) + "]"
+    for (name,) in con.execute(f"SELECT filename FROM read_text({lst}) "
+                               f"WHERE strpos(content, chr(13)) > 0 OR strpos(content, chr(2)) > 0").fetchall():
+        SLOW_FILES.add(os.path.abspath(name))
 
 
 def field_regex(n):
@@ -76,17 +65,67 @@ def field_regex(n):
     return "^" + fld + ("(," + fld + "){%d}" % (n - 1) if n > 1 else "") + "$"
 
 
-def parsed_sql(files, names):
-    """Apply the CSV dialect: drop malformed lines, strip quotes, '' -> NULL."""
+def exact_sql(path, names):
+    """Byte-exact path: split the file on \\n ourselves, validate each line by regex."""
     n = len(names)
     cols = ", ".join(f"NULLIF(f[{i + 1}], '') AS {c}" for i, c in enumerate(names))
-    return (f"SELECT {cols} FROM (SELECT string_split(replace(line, '\"', ''), ',') AS f "
-            f"FROM ({lines_sql(files)}) WHERE regexp_full_match(line, '{field_regex(n)}'))")
+    return (f"SELECT {cols} FROM (SELECT string_split(replace(line, '\"', ''), ',') AS f FROM "
+            f"(SELECT unnest(string_split(content, chr(10))[2:]) AS line FROM read_text({sql_str(path)})) "
+            f"WHERE regexp_full_match(line, '{field_regex(n)}'))")
+
+
+def native_sql(paths, names):
+    """Fast path, DuckDB's parallel CSV reader with quoting off, so it only splits
+    on ',' and '\\n'. One extra column plus null_padding and a null string that
+    never occurs tell the field count apart: a line is well-formed iff its last
+    real column is present and the extra one is absent (lines with two or more
+    extra fields are rejected by strict_mode and skipped by ignore_errors; empty
+    lines are skipped). Quotes are then checked and stripped per field."""
+    lst = "[" + ",".join(sql_str(p) for p in paths) + "]"
+    cols = ", ".join(f"'{c}':'VARCHAR'" for c in names) + ", '_extra':'VARCHAR'"
+    src = (f"read_csv({lst}, columns={{{cols}}}, delim=',', quote='', escape='', comment='', header=true, "
+           f"new_line='\\n', auto_detect=false, nullstr='\\x02', strict_mode=true, ignore_errors=true, "
+           f"null_padding=true)")
+    strip = ", ".join(
+        f"CASE WHEN length({c}) >= 2 AND starts_with({c}, '\"') AND ends_with({c}, '\"') "
+        f"THEN substr({c}, 2, length({c}) - 2) ELSE {c} END AS {c}" for c in names)
+    out = ", ".join(f"NULLIF({c}, '') AS {c}" for c in names)
+    return (f"SELECT {out} FROM (SELECT {strip} FROM {src} WHERE {names[-1]} IS NOT NULL AND _extra IS NULL) "
+            f"WHERE strpos(concat({', '.join(names)}), '\"') = 0")
+
+
+def parsed_sql(files, names):
+    """Apply the CSV dialect: drop malformed lines, strip quotes, '' -> NULL."""
+    fast = [f for f in files if os.path.abspath(f) not in SLOW_FILES]
+    slow = [f for f in files if os.path.abspath(f) in SLOW_FILES]
+    parts = ([native_sql(fast, names)] if fast else []) + [exact_sql(f, names) for f in slow]
+    if not parts:
+        return "SELECT " + ", ".join(f"NULL::VARCHAR AS {c}" for c in names) + " WHERE false"
+    return " UNION ALL ".join(f"({p})" for p in parts)
+
+
+class Profiled:
+    """With PROFILE_DIR set, writes DuckDB's operator timings for every CREATE/COPY
+    statement to PROFILE_DIR/NN.txt. Off by default."""
+
+    def __init__(self, con, out_dir):
+        self.con, self.dir, self.n = con, out_dir, 0
+        os.makedirs(out_dir, exist_ok=True)
+        con.execute("PRAGMA enable_profiling = 'query_tree'")
+
+    def execute(self, q, *a):
+        if q.lstrip().startswith(("CREATE TABLE", "CREATE OR REPLACE TABLE", "COPY")):
+            self.n += 1
+            self.con.execute(f"SET profiling_output = '{self.dir}/{self.n:02d}.txt'")
+        return self.con.execute(q, *a)
 
 
 con = duckdb.connect()
+if os.environ.get("PROFILE_DIR"):
+    con = Profiled(con, os.environ["PROFILE_DIR"])
 con.execute(f"SET threads = {NCPU}")
 con.execute(f"SET memory_limit = '{max(1, int(MEM_GB * 0.75))}GB'")
+os.makedirs(os.path.join(SCRATCH, 'duckdb_tmp'), exist_ok=True)
 con.execute(f"SET temp_directory = '{os.path.join(SCRATCH, 'duckdb_tmp')}'")
 con.execute("SET preserve_insertion_order = false")
 
@@ -98,6 +137,9 @@ DAY = 86_400_000
 WEEK = 7 * DAY
 GAP = 1_800_000
 log(f"window {manifest['window_start']} .. {manifest['window_end']}")
+find_slow_files(csv_files("events") + csv_files("clicks") + csv_files("links")
+                + [os.path.join(DATA, "products.csv"), os.path.join(DATA, "campaigns.csv")])
+log(f"files needing the exact reader: {len(SLOW_FILES)}")
 
 # ---------------------------------------------------------------- timestamp macros
 con.execute("""
@@ -192,33 +234,37 @@ SELECT i.id, r.id AS person FROM lab JOIN ids i ON i.n = lab.v JOIN ids r ON r.n
 log(f"links: {con.execute('SELECT count(*) FROM idmap').fetchone()[0]} ids, {it} iterations")
 
 # ---------------------------------------------------------------- events
-con.execute(f"""
-CREATE TABLE ev_raw AS SELECT * FROM ({parsed_sql(csv_files('events'),
-    ['event_id', 'user_id', 'ts', 'ingest_ts', 'event_type', 'product_id', 'price_cents'])})
-WHERE event_id IS NOT NULL
-""")
-log(f"events parsed: {con.execute('SELECT count(*) FROM ev_raw').fetchone()[0]}")
-# Dedup: the copy with the smallest ingest_ts (always F1, so string order is time order).
+# Every parsed copy is typed and judged on its own (`ok`), then dedup keeps the
+# copy with the smallest ingest_ts and the event survives only if that copy is ok.
+# ingest_ts is always valid F1, so strptime parses it exactly.
 con.execute(f"""
 CREATE TABLE ev AS
-WITH kept AS (
-    SELECT arg_min(struct_pack(user_id, ts, ingest_ts, event_type, product_id, price_cents), ingest_ts) AS r
-    FROM ev_raw GROUP BY event_id
+WITH raw AS (
+    SELECT * FROM ({parsed_sql(csv_files('events'),
+        ['event_id', 'user_id', 'ts', 'ingest_ts', 'event_type', 'product_id', 'price_cents'])})
+    WHERE event_id IS NOT NULL
 ), typed AS (
-    SELECT r.user_id, parse_ts(r.ts) AS ts, iso_ms(r.ingest_ts) AS ing, r.event_type, r.product_id,
-           CASE WHEN r.event_type = 'purchase' AND regexp_full_match(r.price_cents, '[0-9]+')
-                THEN TRY_CAST(ltrim(r.price_cents, '0') AS BIGINT) END AS price
-    FROM kept
+    SELECT event_id, user_id, product_id, event_type = 'purchase' AS is_p,
+           parse_ts(ts) AS t, epoch_ms(strptime(ingest_ts, '%Y-%m-%dT%H:%M:%SZ')) AS ing,
+           CASE WHEN event_type = 'purchase' AND regexp_full_match(price_cents, '[0-9]+')
+                THEN TRY_CAST(ltrim(price_cents, '0') AS BIGINT) END AS price,
+           event_type
+    FROM raw
+), judged AS (
+    SELECT event_id, ing, user_id, t, is_p, price, product_id,
+           coalesce(user_id IS NOT NULL AND t >= {WS} AND t < {WE}
+                    AND event_type IN ('view', 'cart', 'purchase') AND product_id IS NOT NULL
+                    AND (NOT is_p OR price BETWEEN 1 AND 10000000)
+                    AND ing - t <= {DAY}, false) AS ok
+    FROM typed
+), kept AS (
+    -- copies with equal ingest_ts are identical, so any one of them may win
+    SELECT * FROM judged QUALIFY row_number() OVER (PARTITION BY event_id ORDER BY ing) = 1
 )
-SELECT coalesce(m.person, t.user_id) AS person, t.ts, t.event_type = 'purchase' AS is_p,
-       CASE WHEN t.event_type = 'purchase' THEN t.price END AS price, t.product_id
-FROM typed t LEFT JOIN idmap m ON m.id = t.user_id
-WHERE t.user_id IS NOT NULL AND t.ts >= {WS} AND t.ts < {WE}
-  AND t.event_type IN ('view', 'cart', 'purchase') AND t.product_id IS NOT NULL
-  AND (t.event_type <> 'purchase' OR t.price BETWEEN 1 AND 10000000)
-  AND t.ing - t.ts <= {DAY}
+SELECT coalesce(m.person, k.user_id) AS person, k.t AS ts, k.is_p, k.price, k.product_id
+FROM kept k LEFT JOIN idmap m ON m.id = k.user_id
+WHERE k.ok
 """)
-con.execute("DROP TABLE ev_raw")
 log(f"events valid: {con.execute('SELECT count(*) FROM ev').fetchone()[0]}")
 
 # Sessionize per person.
